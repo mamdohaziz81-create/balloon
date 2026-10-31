@@ -108,3 +108,164 @@ jobs:
                       val i = Intent(this, CaptureService::class.java)
                           .putExtra("code", res).putExtra("data", data)
                       startForegroundService(i)
+                      moveTaskToBack(true) // افتح اللعبة بعدها
+                  }
+              }
+          }
+          END_OF_FILE
+          mkdir -p src/main/java/com/example/balloonhelper
+          cat > src/main/java/com/example/balloonhelper/CaptureService.kt <<'END_OF_FILE'
+          package com.example.balloonhelper
+
+          import android.app.*
+          import android.content.Context
+          import android.content.Intent
+          import android.graphics.*
+          import android.hardware.display.DisplayManager
+          import android.media.ImageReader
+          import android.media.projection.MediaProjection
+          import android.media.projection.MediaProjectionManager
+          import android.os.*
+          import android.view.*
+          import kotlin.math.sqrt
+
+          class CaptureService : Service() {
+              private lateinit var projection: MediaProjection
+              private lateinit var reader: ImageReader
+              private lateinit var overlay: OverlayView
+              private lateinit var wm: WindowManager
+              private val handler = Handler(Looper.getMainLooper())
+              private var busy = false
+
+              override fun onBind(i: Intent?) = null
+
+              override fun onStartCommand(intent: Intent?, f: Int, id: Int): Int {
+                  val ch = "bh"
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel(ch, "Balloon Helper", NotificationManager.IMPORTANCE_LOW))
+                  val n = Notification.Builder(this, ch).setContentTitle("Balloon Helper شغال")
+                      .setSmallIcon(android.R.drawable.ic_menu_view).build()
+                  startForeground(1, n, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+
+                  val code = intent!!.getIntExtra("code", 0)
+                  val data = intent.getParcelableExtra<Intent>("data")!!
+                  val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                  projection = mpm.getMediaProjection(code, data)
+                  projection.registerCallback(object : MediaProjection.Callback() {}, handler)
+
+                  wm = getSystemService(WINDOW_SERVICE) as WindowManager
+                  val dm = resources.displayMetrics
+                  reader = ImageReader.newInstance(dm.widthPixels, dm.heightPixels, PixelFormat.RGBA_8888, 2)
+                  projection.createVirtualDisplay("cap", dm.widthPixels, dm.heightPixels, dm.densityDpi,
+                      DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, reader.surface, null, handler)
+
+                  overlay = OverlayView(this)
+                  wm.addView(overlay, WindowManager.LayoutParams(
+                      -1, -1, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                          WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                      PixelFormat.TRANSLUCENT))
+
+                  handler.post(loop)
+                  return START_NOT_STICKY
+              }
+
+              private val loop = object : Runnable {
+                  override fun run() {
+                      if (!busy) {
+                          val img = reader.acquireLatestImage()
+                          if (img != null) {
+                              busy = true
+                              val p = img.planes[0]
+                              val rowPad = (p.rowStride - p.pixelStride * img.width) / p.pixelStride
+                              val bmp = Bitmap.createBitmap(img.width + rowPad, img.height, Bitmap.Config.ARGB_8888)
+                              bmp.copyPixelsFromBuffer(p.buffer)
+                              val w = img.width; val h = img.height
+                              img.close()
+                              Thread {
+                                  val small = Bitmap.createScaledBitmap(Bitmap.createBitmap(bmp, 0, 0, w, h), w / 6, h / 6, true)
+                                  val groups = BalloonDetector.detect(small, 6)
+                                  handler.post { overlay.groups = groups; overlay.invalidate(); busy = false }
+                              }.start()
+                          }
+                      }
+                      handler.postDelayed(this, 700)
+                  }
+              }
+
+              override fun onDestroy() {
+                  handler.removeCallbacksAndMessages(null)
+                  if (::overlay.isInitialized) wm.removeView(overlay)
+                  if (::projection.isInitialized) projection.stop()
+                  super.onDestroy()
+              }
+          }
+
+          data class Blob(val x: Float, val y: Float, val r: Float)
+
+          object BalloonDetector {
+              // يرجع مجموعات: كل مجموعة = بالونات بنفس اللون (2 أو أكتر)
+              fun detect(bmp: Bitmap, scale: Int): List<List<Blob>> {
+                  val w = bmp.width; val h = bmp.height
+                  val px = IntArray(w * h); bmp.getPixels(px, 0, w, 0, 0, w, h)
+                  val bucket = IntArray(w * h) { -1 }
+                  val hsv = FloatArray(3)
+                  for (i in px.indices) {
+                      Color.colorToHSV(px[i], hsv)
+                      if (hsv[1] > 0.5f && hsv[2] > 0.45f) bucket[i] = (hsv[0] / 20f).toInt() % 18
+                  }
+                  val seen = BooleanArray(w * h)
+                  val byColor = HashMap<Int, MutableList<Blob>>()
+                  val stack = IntArray(w * h)
+                  for (s in px.indices) {
+                      if (bucket[s] < 0 || seen[s]) continue
+                      val b = bucket[s]; var sp = 0; stack[sp++] = s; seen[s] = true
+                      var area = 0; var sx = 0L; var sy = 0L
+                      while (sp > 0) {
+                          val c = stack[--sp]; val cx = c % w; val cy = c / w
+                          area++; sx += cx; sy += cy
+                          for ((dx, dy) in listOf(1 to 0, -1 to 0, 0 to 1, 0 to -1)) {
+                              val nx = cx + dx; val ny = cy + dy
+                              if (nx !in 0 until w || ny !in 0 until h) continue
+                              val ni = ny * w + nx
+                              if (!seen[ni] && bucket[ni] == b) { seen[ni] = true; stack[sp++] = ni }
+                          }
+                      }
+                      if (area >= 40) { // تجاهل البقع الصغيرة
+                          byColor.getOrPut(b) { mutableListOf() }.add(
+                              Blob(sx.toFloat() / area * scale, sy.toFloat() / area * scale,
+                                  sqrt(area / Math.PI).toFloat() * scale))
+                      }
+                  }
+                  return byColor.values.filter { it.size >= 2 }
+              }
+          }
+
+          class OverlayView(c: Context) : View(c) {
+              var groups: List<List<Blob>> = emptyList()
+              private val p = Paint().apply { style = Paint.Style.STROKE; strokeWidth = 8f; isAntiAlias = true }
+              private val palette = intArrayOf(Color.WHITE, Color.BLACK, Color.MAGENTA, Color.CYAN, Color.YELLOW)
+
+              override fun onDraw(cv: Canvas) {
+                  groups.forEachIndexed { i, g ->
+                      p.color = palette[i % palette.size]
+                      g.forEach { cv.drawCircle(it.x, it.y, it.r + 6f, p) }
+                  }
+              }
+          }
+          END_OF_FILE
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BalloonHelper-APK
+          path: build/outputs/apk/debug/*.apk
