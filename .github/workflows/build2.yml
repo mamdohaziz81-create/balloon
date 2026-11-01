@@ -1,0 +1,431 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create project files
+        run: |
+          cat > settings.gradle.kts <<'END_OF_FILE'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "BalloonHelper"
+          END_OF_FILE
+          cat > build.gradle.kts <<'END_OF_FILE'
+          plugins {
+              id("com.android.application") version "8.5.2"
+              id("org.jetbrains.kotlin.android") version "1.9.24"
+          }
+
+          android {
+              namespace = "com.example.balloonhelper"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.example.balloonhelper"
+                  minSdk = 29
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+          END_OF_FILE
+          mkdir -p src/main
+          cat > src/main/AndroidManifest.xml <<'END_OF_FILE'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION"/>
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+              <application android:label="Balloon Helper" android:theme="@android:style/Theme.DeviceDefault.Light">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+                  <service android:name=".CaptureService" android:exported="false"
+                      android:foregroundServiceType="mediaProjection"/>
+              </application>
+          </manifest>
+          END_OF_FILE
+          mkdir -p src/main/java/com/example/balloonhelper
+          cat > src/main/java/com/example/balloonhelper/MainActivity.kt <<'END_OF_FILE'
+          package com.example.balloonhelper
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.media.projection.MediaProjectionManager
+          import android.net.Uri
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.widget.Button
+
+          class MainActivity : Activity() {
+              private val REQ = 42
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  val btn = Button(this).apply { text = "ابدأ المساعد" }
+                  setContentView(btn)
+                  if (android.os.Build.VERSION.SDK_INT >= 33)
+                      requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 1)
+                  btn.setOnClickListener {
+                      if (!Settings.canDrawOverlays(this)) {
+                          startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                              Uri.parse("package:$packageName")))
+                      } else {
+                          val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                          startActivityForResult(mpm.createScreenCaptureIntent(), REQ)
+                      }
+                  }
+              }
+
+              override fun onActivityResult(r: Int, res: Int, data: Intent?) {
+                  super.onActivityResult(r, res, data)
+                  if (r == REQ && res == RESULT_OK && data != null) {
+                      val i = Intent(this, CaptureService::class.java)
+                          .putExtra("code", res).putExtra("data", data)
+                      startForegroundService(i)
+                      moveTaskToBack(true) // افتح اللعبة بعدها
+                  }
+              }
+          }
+          END_OF_FILE
+          mkdir -p src/main/java/com/example/balloonhelper
+          cat > src/main/java/com/example/balloonhelper/CaptureService.kt <<'END_OF_FILE'
+          package com.example.balloonhelper
+
+          import android.app.*
+          import android.content.Context
+          import android.content.Intent
+          import android.graphics.*
+          import android.hardware.display.DisplayManager
+          import android.media.ImageReader
+          import android.media.projection.MediaProjection
+          import android.media.projection.MediaProjectionManager
+          import android.os.*
+          import android.view.*
+          import kotlin.math.sqrt
+
+          class CaptureService : Service() {
+              private lateinit var projection: MediaProjection
+              private lateinit var reader: ImageReader
+              private lateinit var overlay: OverlayView
+              private lateinit var wm: WindowManager
+              private val handler = Handler(Looper.getMainLooper())
+              private var busy = false
+
+              override fun onBind(i: Intent?) = null
+
+              override fun onStartCommand(intent: Intent?, f: Int, id: Int): Int {
+                  val ch = "bh"
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel(ch, "Balloon Helper", NotificationManager.IMPORTANCE_LOW))
+                  val n = Notification.Builder(this, ch).setContentTitle("Balloon Helper شغال")
+                      .setSmallIcon(android.R.drawable.ic_menu_view).build()
+                  startForeground(1, n, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+
+                  val code = intent!!.getIntExtra("code", 0)
+                  val data = intent.getParcelableExtra<Intent>("data")!!
+                  val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                  projection = mpm.getMediaProjection(code, data)
+                  projection.registerCallback(object : MediaProjection.Callback() {}, handler)
+
+                  wm = getSystemService(WINDOW_SERVICE) as WindowManager
+                  val dm = resources.displayMetrics
+                  reader = ImageReader.newInstance(dm.widthPixels, dm.heightPixels, PixelFormat.RGBA_8888, 2)
+                  projection.createVirtualDisplay("cap", dm.widthPixels, dm.heightPixels, dm.densityDpi,
+                      DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, reader.surface, null, handler)
+
+                  overlay = OverlayView(this)
+                  wm.addView(overlay, WindowManager.LayoutParams(
+                      -1, -1, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                          WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                      PixelFormat.TRANSLUCENT))
+
+                  handler.post(loop)
+                  return START_NOT_STICKY
+              }
+
+              private val loop = object : Runnable {
+                  override fun run() {
+                      if (!busy) {
+                          val img = reader.acquireLatestImage()
+                          if (img != null) {
+                              busy = true
+                              val p = img.planes[0]
+                              val rowPad = (p.rowStride - p.pixelStride * img.width) / p.pixelStride
+                              val bmp = Bitmap.createBitmap(img.width + rowPad, img.height, Bitmap.Config.ARGB_8888)
+                              bmp.copyPixelsFromBuffer(p.buffer)
+                              val w = img.width; val h = img.height
+                              img.close()
+                              val prev = overlay.markers.map { PointF(it.x, it.y) }
+                              Thread {
+                                  val full = if (rowPad == 0) bmp else Bitmap.createBitmap(bmp, 0, 0, w, h)
+                                  val small = Bitmap.createScaledBitmap(full, w / 4, h / 4, true)
+                                  val result = try {
+                                      BalloonDetector.detect(full, small, 4, prev)
+                                  } catch (e: Exception) {
+                                      emptyList()
+                                  }
+                                  small.recycle()
+                                  if (full !== bmp) full.recycle()
+                                  bmp.recycle()
+                                  handler.post { overlay.markers = result; overlay.invalidate(); busy = false }
+                              }.start()
+                          }
+                      }
+                      handler.postDelayed(this, 700)
+                  }
+              }
+
+              override fun onDestroy() {
+                  handler.removeCallbacksAndMessages(null)
+                  if (::overlay.isInitialized) wm.removeView(overlay)
+                  if (::projection.isInitialized) projection.stop()
+                  super.onDestroy()
+              }
+          }
+
+          data class Marker(val x: Float, val y: Float, val slot: Int, val score: Float)
+
+          object BalloonDetector {
+              private const val NB = 39   // عدد سلالات الألوان
+              private const val CH = 40   // + عداد البيكسلات الصالحة
+
+              private class Icon(val slot: Int, val hist: FloatArray)
+              private class Cand(val sc: Float, val j: Int, val cx: Int, val cy: Int, val r: Int)
+
+              // يحوّل لون البيكسل لرقم سلالة (-1 = تجاهل، زي خلفية اللعبة الزرقاء)
+              private fun bin(c: Int, hsv: FloatArray): Int {
+                  Color.colorToHSV(c, hsv)
+                  val h = hsv[0]; val s = hsv[1]; val v = hsv[2]
+                  if (h >= 185f && h <= 235f && v < 0.5f && s > 0.3f) return -1
+                  if (s > 0.35f && v > 0.35f) {
+                      return ((h / 20f).toInt() % 18) * 2 + (if (s > 0.7f) 1 else 0)
+                  }
+                  if (v <= 0.35f) return 36
+                  return if (v > 0.75f) 37 else 38
+              }
+
+              private fun median(a: IntArray): Int {
+                  a.sort()
+                  return a[a.size / 2]
+              }
+
+              // بيقرا أيقونات الأهداف من الشريط اللي فوق ويعمل لكل واحدة بصمة ألوان
+              private fun readIcons(full: Bitmap): List<Icon> {
+                  val fw = full.width; val fh = full.height
+                  val list = ArrayList<Icon>()
+                  val hsv = FloatArray(3)
+                  for (k in 0 until 8) {
+                      val cx = ((0.0806f + 0.1364f * k) * fw).toInt()
+                      val hw = (0.047f * fw).toInt()
+                      if (cx + hw > fw) break
+                      val y0 = (0.12375f * fh).toInt(); val y1 = (0.1675f * fh).toInt()
+                      val rw = 2 * hw; val rh = y1 - y0
+                      if (rw <= 0 || rh <= 0) continue
+                      val px = IntArray(rw * rh)
+                      full.getPixels(px, 0, rw, cx - hw, y0, rw, rh)
+
+                      // لون خلفية الخانة من ركنها
+                      val bx0 = cx + (0.035f * fw).toInt(); val bx1 = cx + (0.050f * fw).toInt()
+                      val by0 = (0.1115f * fh).toInt(); val by1 = (0.1175f * fh).toInt()
+                      val bw = bx1 - bx0; val bh = by1 - by0
+                      if (bw <= 0 || bh <= 0 || bx1 > fw) continue
+                      val bp = IntArray(bw * bh)
+                      full.getPixels(bp, 0, bw, bx0, by0, bw, bh)
+                      val br = median(IntArray(bp.size) { Color.red(bp[it]) })
+                      val bg = median(IntArray(bp.size) { Color.green(bp[it]) })
+                      val bb = median(IntArray(bp.size) { Color.blue(bp[it]) })
+
+                      val hist = FloatArray(NB)
+                      var fg = 0; var valid = 0
+                      for (yy in 0 until rh) {
+                          for (xx in 0 until rw) {
+                              if (yy < rh * 0.2f && xx < rw * 0.4f) continue // رقم العدد
+                              val c = px[yy * rw + xx]
+                              val dr = Color.red(c) - br; val dg = Color.green(c) - bg; val db = Color.blue(c) - bb
+                              if (dr * dr + dg * dg + db * db > 45 * 45) {
+                                  fg++
+                                  val b = bin(c, hsv)
+                                  if (b >= 0) { hist[b] += 1f; valid++ }
+                              }
+                          }
+                      }
+                      if (fg.toFloat() / (rw * rh) < 0.12f || valid == 0) continue // خانة فاضية
+                      for (i in 0 until NB) hist[i] /= valid
+                      list.add(Icon(k, hist))
+                  }
+                  return list
+              }
+
+              fun detect(full: Bitmap, small: Bitmap, S: Int, prev: List<PointF>): List<Marker> {
+                  val icons = readIcons(full)
+                  if (icons.isEmpty()) return emptyList()
+
+                  val sw = small.width; val sh = small.height
+                  val top = (sh * 0.22f).toInt(); val bot = (sh * 0.72f).toInt()
+                  val hh = bot - top
+                  val rx = (sw * 0.82f).toInt(); val ry = (sh * 0.29f).toInt()
+                  val px = IntArray(sw * sh)
+                  small.getPixels(px, 0, sw, 0, 0, sw, sh)
+
+                  // خريطة السلالات لمنطقة الكومة بس
+                  val bins = IntArray(sw * hh)
+                  val hsv = FloatArray(3)
+                  for (y in 0 until hh) {
+                      val yy = y + top
+                      for (x in 0 until sw) {
+                          bins[y * sw + x] = if (x >= rx && yy < ry) -1 else bin(px[yy * sw + x], hsv)
+                      }
+                  }
+                  // تجاهل علامات المساعد اللي رسمها قبل كده
+                  val mr = 0.05f * full.width / S
+                  for (p in prev) {
+                      val mx = p.x / S; val my = p.y / S - top
+                      val ya = maxOf(0, (my - mr).toInt()); val yb = minOf(hh - 1, (my + mr).toInt())
+                      val xa = maxOf(0, (mx - mr).toInt()); val xb = minOf(sw - 1, (mx + mr).toInt())
+                      for (y in ya..yb) for (x in xa..xb) {
+                          val dx = x - mx; val dy = y - my
+                          if (dx * dx + dy * dy <= mr * mr) bins[y * sw + x] = -1
+                      }
+                  }
+
+                  // integral histogram: بيخلي حساب بصمة أي مربع سريع
+                  val w1 = sw + 1
+                  val integ = IntArray((hh + 1) * w1 * CH)
+                  val acc = IntArray(CH)
+                  for (y in 0 until hh) {
+                      java.util.Arrays.fill(acc, 0)
+                      for (x in 0 until sw) {
+                          val b = bins[y * sw + x]
+                          if (b >= 0) { acc[b]++; acc[NB]++ }
+                          val idx = ((y + 1) * w1 + (x + 1)) * CH
+                          val up = (y * w1 + (x + 1)) * CH
+                          for (k in 0 until CH) integ[idx + k] = integ[up + k] + acc[k]
+                      }
+                  }
+                  val wv = IntArray(CH)
+                  fun query(cx: Int, cy: Int, r: Int) {
+                      val x0 = maxOf(cx - r, 0); val x1 = minOf(cx + r, sw)
+                      val y0 = maxOf(cy - r, 0); val y1 = minOf(cy + r, hh)
+                      val a = (y1 * w1 + x1) * CH; val b = (y0 * w1 + x1) * CH
+                      val c = (y1 * w1 + x0) * CH; val d = (y0 * w1 + x0) * CH
+                      for (k in 0 until CH) wv[k] = integ[a + k] - integ[b + k] - integ[c + k] + integ[d + k]
+                  }
+
+                  // بنمسح الكومة بمربعات بأحجام البالونات ونقارن بصمتها بكل أيقونة
+                  val cands = ArrayList<Cand>()
+                  val radii = intArrayOf((sw * 0.061f).toInt(), (sw * 0.083f).toInt(), (sw * 0.106f).toInt())
+                  for (r in radii) {
+                      if (r < 2) continue
+                      var cy = r / 2
+                      while (cy < hh - r / 2) {
+                          var cx = r / 2
+                          while (cx < sw - r / 2) {
+                              query(cx, cy, r)
+                              val n = wv[NB]
+                              if (n >= (2 * r) * (2 * r) * 0.6f) {
+                                  var best = -1; var bestSc = 0f
+                                  for (j in icons.indices) {
+                                      val ih = icons[j].hist
+                                      var sc = 0f
+                                      for (k in 0 until NB) {
+                                          val v = wv[k].toFloat() / n
+                                          sc += if (v < ih[k]) v else ih[k]
+                                      }
+                                      if (sc > bestSc) { bestSc = sc; best = j }
+                                  }
+                                  if (best >= 0) cands.add(Cand(bestSc, best, cx, cy, r))
+                              }
+                              cx += 3
+                          }
+                          cy += 3
+                      }
+                  }
+                  cands.sortByDescending { it.sc }
+
+                  // أفضل 3 مواضع لكل هدف بدون تراكب
+                  val picked = Array(icons.size) { ArrayList<Cand>() }
+                  for (c in cands) {
+                      if (c.sc < 0.5f) break
+                      val lst = picked[c.j]
+                      if (lst.size >= 3) continue
+                      var ok = true
+                      for (o in lst) {
+                          val dx = (c.cx - o.cx).toFloat(); val dy = (c.cy - o.cy).toFloat()
+                          if (dx * dx + dy * dy <= (1.4f * c.r) * (1.4f * c.r)) { ok = false; break }
+                      }
+                      if (ok) lst.add(c)
+                  }
+                  val out = ArrayList<Marker>()
+                  for (j in icons.indices) for (c in picked[j]) {
+                      out.add(Marker(c.cx.toFloat() * S, (c.cy + top).toFloat() * S, icons[j].slot, c.sc))
+                  }
+                  return out
+              }
+          }
+
+          class OverlayView(c: Context) : View(c) {
+              var markers: List<Marker> = emptyList()
+              private val fill = Paint(Paint.ANTI_ALIAS_FLAG)
+              private val edge = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; color = Color.BLACK }
+              private val txt = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  color = Color.BLACK; textAlign = Paint.Align.CENTER; isFakeBoldText = true
+              }
+              private val palette = intArrayOf(
+                  0xFFFF00FF.toInt(), 0xFFFFFF00.toInt(), 0xFF00FFFF.toInt(), 0xFFFFA500.toInt(),
+                  0xFF00FF00.toInt(), 0xFF4D96FF.toInt(), 0xFFFF8080.toInt(), 0xFFFFFFFF.toInt())
+
+              override fun onDraw(cv: Canvas) {
+                  val r = width * 0.036f
+                  edge.strokeWidth = r * 0.25f
+                  txt.textSize = r * 1.3f
+                  for (m in markers) {
+                      fill.color = palette[m.slot % palette.size]
+                      fill.alpha = if (m.score >= 0.65f) 255 else 150
+                      cv.drawCircle(m.x, m.y, r, fill)
+                      cv.drawCircle(m.x, m.y, r, edge)
+                      cv.drawText((m.slot + 1).toString(), m.x, m.y + r * 0.45f, txt)
+                  }
+              }
+          }
+          END_OF_FILE
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BalloonHelper-APK
+          path: build/outputs/apk/debug/*.apk
